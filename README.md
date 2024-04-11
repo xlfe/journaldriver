@@ -9,15 +9,12 @@ languages with error-prone "cover every possible use-case"
 configuration. `journaldriver` instead aims to fit a specific use-case
 very well, instead of covering every possible logging setup.
 
-`journaldriver` can be run on GCP-instances with no additional
-configuration as authentication tokens are retrieved from the
-[metadata server][].
+This fork of `journaldriver` is designed to run outside of GCP
 
 <!-- markdown-toc start - Don't edit this section. Run M-x markdown-toc-refresh-toc -->
 **Table of Contents**
 
 - [Features](#features)
-- [Usage on Google Cloud Platform](#usage-on-google-cloud-platform)
 - [Usage outside of Google Cloud Platform](#usage-outside-of-google-cloud-platform)
 - [Log levels / severities / priorities](#log-levels--severities--priorities)
 - [NixOS module](#nixos-module)
@@ -37,23 +34,6 @@ configuration as authentication tokens are retrieved from the
 * `journaldriver` will recognise journald's log priority levels and
   convert them into equivalent Stackdriver log severity levels
 
-# Usage on Google Cloud Platform
-
-`journaldriver` does not require any configuration when running on GCP
-instances.
-
-1. Install `journaldriver` on the instance from which you wish to
-   forward logs.
-
-2. Ensure that the instance has the appropriate permissions to write
-   to Stackdriver. Google continously changes how IAM is implemented
-   on GCP, so you will have to refer to [Google's documentation][].
-
-   By default instances have the required permissions if Stackdriver
-   Logging support is enabled in the project.
-
-3. Start `journaldriver`, for example via `systemd`.
-
 # Usage outside of Google Cloud Platform
 
 When running outside of GCP, the following extra steps need to be
@@ -68,8 +48,6 @@ performed:
      should be written.
    * `GOOGLE_APPLICATION_CREDENTIALS`: Filesystem path to the
      JSON-file containing the service account's private key.
-   * `LOG_STREAM`: Name of the target log stream in Stackdriver Logging.
-     This will be automatically created if it does not yet exist.
    * `LOG_NAME`: Name of the target log to write to. This defaults to
      `journaldriver` if unset, but it is recommended to - for
      example - set it to the machine hostname.
@@ -92,57 +70,8 @@ $ echo '<4>{"fnord":true, "msg":"structured log (warning)"}' | systemd-cat
 $ echo '<4>unstructured log (warning)' | systemd-cat
 ```
 
-# NixOS module
-
-The NixOS package repository [contains a module][] for setting up
-`journaldriver` on NixOS machines. NixOS by default uses `systemd` for
-service management and `journald` for logging, which means that log
-output from most services will be captured automatically.
-
-On a GCP instance the only required option is this:
-
-```nix
-services.journaldriver.enable = true;
-```
-
-When running outside of GCP, the configuration looks as follows:
-
-```nix
-services.journaldriver = {
-  enable                 = true;
-  logStream              = "prod-environment";
-  logName                = "hostname";
-  googleCloudProject     = "gcp-project-name";
-  applicationCredentials = keyFile;
-};
-```
-
-**Note**: The `journaldriver`-module is included in stable releases of
-NixOS since NixOS 18.09.
-
-# Stackdriver Error Reporting
-
-The [Stackdriver Error Reporting][] service of Google's monitoring
-toolbox supports automatically detecting and correlating errors from
-log entries.
-
-To use this functionality log messages must be logged in the expected
-[log format][].
-
-*Note*: Reporting errors from non-GCP instances requires that the
-`LOG_STREAM` environment variable is set to the special value
-`global`.
-
-This value changes the monitored resource descriptor from a log stream
-to the project-global stream. Due to a limitation in Stackdriver Error
-Reporting, this is the only way to correctly ingest errors from
-non-GCP machines. Please see [issue #4][] for more information about
-this.
-
 [Stackdriver Logging]: https://cloud.google.com/logging/
-[metadata server]: https://cloud.google.com/compute/docs/storing-retrieving-metadata
 [Google's documentation]: https://cloud.google.com/logging/docs/access-control
-[NixOS]: https://nixos.org/
 [contains a module]: https://github.com/NixOS/nixpkgs/pull/42134
 [journald's priorities]: http://0pointer.de/public/systemd-man/sd-daemon.html
 [equivalent severities]: https://cloud.google.com/logging/docs/reference/v2/rest/v2/LogEntry#logseverity

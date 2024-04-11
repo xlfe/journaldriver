@@ -44,10 +44,11 @@ extern crate serde;
 extern crate systemd;
 extern crate ureq;
 
+use ureq::{Agent, AgentBuilder};
 use chrono::offset::LocalResult;
 use chrono::prelude::*;
 use failure::ResultExt;
-use serde_json::{from_str, Value};
+use serde_json::{Value};
 use std::env;
 use std::fs::{self, File, rename};
 use std::io::{self, Read, ErrorKind, Write};
@@ -55,7 +56,7 @@ use std::mem;
 use std::path::PathBuf;
 use std::process;
 use std::time::{Duration, Instant};
-use systemd::journal::*;
+use systemd::journal::{JournalSeek,JournalRecord,Journal};
 
 #[cfg(test)]
 mod tests;
@@ -98,11 +99,6 @@ lazy_static! {
         .and_then(|path| File::open(path).ok())
         .and_then(|file| serde_json::from_reader(file).ok());
 
-    /// Descriptor of the currently monitored instance. Refer to the
-    /// documentation of `determine_monitored_resource` for more
-    /// information.
-    static ref MONITORED_RESOURCE: Value = determine_monitored_resource();
-
     /// Path to the directory in which journaldriver should persist
     /// its cursor state.
     static ref CURSOR_DIR: PathBuf = env::var("CURSOR_POSITION_DIR")
@@ -122,85 +118,16 @@ lazy_static! {
         path.push("cursor.tmp");
         path
     };
-}
 
-/// Convenience helper for retrieving values from the metadata server.
-fn get_metadata(url: &str) -> Result<String> {
-    let response = ureq::get(url)
-        .set("Metadata-Flavor", "Google")
-        .timeout_connect(5000)
-        .timeout_read(5000)
-        .call();
-
-    if response.ok() {
-        // Whitespace is trimmed to remove newlines from responses.
-        let body = response.into_string()
-            .context("Failed to decode metadata response")?
-            .trim().to_string();
-
-        Ok(body)
-    } else {
-        let status = response.status_line().to_string();
-        let body = response.into_string()
-            .unwrap_or_else(|e| format!("Metadata body error: {}", e));
-        bail!("Metadata failure: {} ({})", body, status)
-    }
+    static ref agent: Agent = AgentBuilder::new()
+      .timeout_read(Duration::from_secs(5))
+      .timeout_write(Duration::from_secs(5))
+      .build();
 }
 
 /// Convenience helper for determining the project ID.
 fn get_project_id() -> String {
-    env::var("GOOGLE_CLOUD_PROJECT")
-        .map_err(Into::into)
-        .or_else(|_: failure::Error| get_metadata(METADATA_PROJECT_URL))
-        .expect("Could not determine project ID")
-}
-
-/// Determines the monitored resource descriptor used in Stackdriver
-/// logs. On GCP this will be set to the instance ID as returned by
-/// the metadata server.
-///
-/// On non-GCP machines the value is determined by using the
-/// `GOOGLE_CLOUD_PROJECT` and `LOG_STREAM` environment variables.
-///
-/// [issue #4]: https://github.com/tazjin/journaldriver/issues/4
-fn determine_monitored_resource() -> Value {
-    if let Ok(log) = env::var("LOG_STREAM") {
-        // The special value `global` is recognised as a log stream name that
-        // results in a `global`-type resource descriptor. This is useful in
-        // cases where Stackdriver Error Reporting is intended to be used on
-        // a non-GCE instance. See [issue #4][] for details.
-        if log == "global" {
-            return json!({
-                "type": "global",
-                "labels": {
-                    "project_id": PROJECT_ID.as_str(),
-                }
-            });
-        }
-
-        json!({
-            "type": "logging_log",
-            "labels": {
-                "project_id": PROJECT_ID.as_str(),
-                "name": log,
-            }
-        })
-    } else {
-        let instance_id = get_metadata(METADATA_ID_URL)
-            .expect("Could not determine instance ID");
-
-        let zone = get_metadata(METADATA_ZONE_URL)
-            .expect("Could not determine instance zone");
-
-        json!({
-            "type": "gce_instance",
-            "labels": {
-                "project_id": PROJECT_ID.as_str(),
-                "instance_id": instance_id,
-                "zone": zone,
-            }
-        })
-    }
+    env::var("GOOGLE_CLOUD_PROJECT").expect("Could not determine project ID")
 }
 
 /// Represents the response returned by the metadata server's token
@@ -224,21 +151,6 @@ impl Token {
     fn is_expired(&self) -> bool {
         self.fetched_at.elapsed() > self.expires
     }
-}
-
-/// Retrieves a token from the GCP metadata service. Retrieving these
-/// tokens requires no additional authentication.
-fn get_metadata_token() -> Result<Token> {
-    let body = get_metadata(METADATA_TOKEN_URL)?;
-    let token: TokenResponse = from_str(&body)?;
-
-    debug!("Fetched new token from metadata service");
-
-    Ok(Token {
-        fetched_at: Instant::now(),
-        expires: Duration::from_secs(token.expires_in / 2),
-        token: token.access_token,
-    })
 }
 
 /// Signs a token using static client credentials configured for a
@@ -273,8 +185,7 @@ fn sign_service_account_token(credentials: &Credentials) -> Result<Token> {
     };
 
     let token = medallion::Token::new(header, payload)
-        .sign(credentials.private_key.as_bytes())
-        .context("Signing service account token failed")?;
+        .sign(credentials.private_key.as_bytes()).unwrap();
 
     debug!("Signed new service account token");
 
@@ -293,11 +204,8 @@ fn sign_service_account_token(credentials: &Credentials) -> Result<Token> {
 /// point at a JSON private key file if service account authentication
 /// is to be used.
 fn get_token() -> Result<Token> {
-    if let Some(credentials) = SERVICE_ACCOUNT_CREDENTIALS.as_ref() {
-        sign_service_account_token(credentials)
-    } else {
-        get_metadata_token()
-    }
+    let credentials = SERVICE_ACCOUNT_CREDENTIALS.as_ref().unwrap();
+    return sign_service_account_token(credentials);
 }
 
 /// This structure represents the different types of payloads
@@ -468,14 +376,14 @@ impl From<JournalRecord> for LogEntry {
 
 /// Attempt to read from the journal. If no new entry is present,
 /// await the next one up to the specified timeout.
-fn receive_next_record(timeout: Duration, journal: &mut Journal)
+fn receive_next_record(timeout: Duration, j: &mut Journal)
                        -> Result<Option<JournalRecord>> {
-    let next_record = journal.next_record()?;
+    let next_record = j.next_entry()?;
     if next_record.is_some() {
         return Ok(next_record);
     }
 
-    Ok(journal.await_next_record(Some(timeout))?)
+    Ok(j.await_next_entry(Some(timeout))?)
 }
 
 /// This function starts a double-looped, blocking receiver. It will
@@ -575,7 +483,13 @@ fn flush(token: &mut Token,
 fn prepare_request(entries: &[LogEntry]) -> Value {
     json!({
         "logName": format!("projects/{}/logs/{}", PROJECT_ID.as_str(), LOG_NAME.as_str()),
-        "resource": &*MONITORED_RESOURCE,
+        "resource": {
+            "type": "logging_log",
+            "labels": {
+                "project_id": PROJECT_ID.as_str(),
+                "name": LOG_NAME.as_str(),
+            }
+        },
         "entries": entries,
         "partialSuccess": true
     })
@@ -583,25 +497,23 @@ fn prepare_request(entries: &[LogEntry]) -> Value {
 
 /// Perform the log entry insertion in Stackdriver Logging.
 fn write_entries(token: &Token, request: Value) -> Result<()> {
-    let response = ureq::post(ENTRIES_WRITE_URL)
+    match agent.post(ENTRIES_WRITE_URL)
         .set("Authorization", format!("Bearer {}", token.token).as_str())
-        // The timeout values are set relatively high, not because of
-        // an expectation of Stackdriver being slow but just to
-        // eventually hit an error case in case of network troubles.
-        // Presumably no request in a functioning environment will
-        // ever hit these limits.
-        .timeout_connect(2000)
-        .timeout_read(5000)
-        .send_json(request);
-
-    if response.ok() {
-        Ok(())
-    } else {
-        let status = response.status_line().to_string();
-        let body = response.into_string()
-            .unwrap_or_else(|_| "no response body".into());
-        bail!("Write failure: {} ({})", body, status)
-    }
+        .send_json(request) {
+            Ok(response) => {
+                Ok(())
+            },
+            Err(ureq::Error::Status(code, response)) => {
+                let result = response.into_string();
+                match result {
+                    Ok(response_string) => bail!("Write failure: {} ({})", response_string, code),
+                    Err(error) => bail!("Write failure: {} ({})", error, code),
+                }
+            }
+            Err(_) => {
+                bail!("Unknown Write failure")
+            }
+        }
 }
 
 /// Attempt to read the initial cursor position from the configured
@@ -647,19 +559,18 @@ fn main () {
     fs::create_dir_all(cursor_position_dir)
         .expect("Could not create directory to store cursor position in");
 
-    let mut journal = Journal::open(JournalFiles::All, false, true)
-        .expect("Failed to open systemd journal");
+    let mut j = systemd::journal::OpenOptions::default().open().unwrap();
 
     let seek_position = initial_cursor()
         .expect("Failed to determine initial cursor position");
 
-    match journal.seek(seek_position) {
-        Ok(cursor) => info!("Opened journal at cursor '{}'", cursor),
+    match j.seek(seek_position) {
+        Ok(cursor) => info!("Opened journal"),
         Err(err) => {
             error!("Failed to set initial journal position: {}", err);
             process::exit(1)
         }
     }
 
-    receiver_loop(journal).expect("log receiver encountered an unexpected error");
+    receiver_loop(j).expect("log receiver encountered an unexpected error");
 }

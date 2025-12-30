@@ -528,6 +528,9 @@ fn initial_cursor() -> Result<JournalSeek> {
         let mut contents = String::new();
         let mut file = File::open(&*CURSOR_FILE)?;
         file.read_to_string(&mut contents)?;
+        if contents.contains('\0') {
+            return Err(io::Error::new(ErrorKind::InvalidData, "cursor file contains null bytes"));
+        }
         Ok(contents.trim().into())
     })();
 
@@ -535,6 +538,10 @@ fn initial_cursor() -> Result<JournalSeek> {
         Ok(cursor) => Ok(JournalSeek::Cursor { cursor }),
         Err(ref err) if err.kind() == ErrorKind::NotFound => {
             info!("No previous cursor position, reading from journal tail");
+            Ok(JournalSeek::Tail)
+        },
+        Err(ref err) if err.kind() == ErrorKind::InvalidData => {
+            warn!("Cursor file is corrupted (contains null bytes), reading from journal tail");
             Ok(JournalSeek::Tail)
         },
         Err(err) => {
